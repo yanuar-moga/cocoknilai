@@ -1,27 +1,25 @@
+# app.py
 """
-MB Tools - Pencocokan Nilai Siswa (FINAL+ Stable)
-- Auto detect kolom nama, nilai, absen (fuzzy tolerant)
-- Penanganan NA / None aman
-- Pewarnaan otomatis sel skor (hijau/kuning/merah)
-- Logika SCORE sesuai permintaan Bayu:
-    - Score_1 >= 80 → SCORE = Score_1
-    - Jika Score_1 < 80 tapi ada Score_2..6 >= 80 → SCORE = 78
-    - Semua <80 → SCORE kosong
-Credit: Apps by MB (Donasi: wa.me/628522939579)
+MB Tools - Pencocokan Nilai Siswa (Streamlit Version)
+Converted by ChatGPT for Bayu (SMPN1Moga)
+- Logic core dipertahankan (match_and_write)
+- GUI: Streamlit
 """
 
 import os
 import time
-import threading
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+import tempfile
+import io
+from datetime import datetime
+
+import streamlit as st
 import pandas as pd
 from rapidfuzz import fuzz
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
 # ---------------------------------------------------------
-# Util helpers
+# Helpers (same logic as original)
 # ---------------------------------------------------------
 def parse_score(raw):
     if pd.isna(raw):
@@ -52,11 +50,8 @@ def cari_kolom_otomatis(df, keywords):
                 return col
     return None
 
-# ---------------------------------------------------------
-# Pewarnaan otomatis Excel
-# ---------------------------------------------------------
 def apply_color(cell, value):
-    if pd.isna(value):
+    if value is None:
         return
     try:
         val = float(value)
@@ -70,12 +65,14 @@ def apply_color(cell, value):
         cell.fill = PatternFill(start_color="B7E1A1", end_color="B7E1A1", fill_type="solid")  # hijau
 
 # ---------------------------------------------------------
-# Core matching logic
+# Core matching logic (accepts file paths)
 # ---------------------------------------------------------
 def match_and_write(respons_path, hasil_path, log_fn=None, progress_fn=None):
     def log(msg):
-        if log_fn: log_fn(msg)
-        else: print(msg)
+        if log_fn:
+            log_fn(msg)
+        else:
+            print(msg)
 
     log("📖 Membaca file Excel...")
     df_resp = pd.read_excel(respons_path, engine="openpyxl")
@@ -87,18 +84,28 @@ def match_and_write(respons_path, hasil_path, log_fn=None, progress_fn=None):
     absen_keys = ["absen", "no", "nomor", "nis", "id"]
     time_keys = ["time", "timestamp", "tgl", "waktu"]
 
-    col_name = cari_kolom_otomatis(df_resp, name_keys) or df_resp.columns[2]
-    col_score = cari_kolom_otomatis(df_resp, score_keys) or df_resp.columns[1]
-    col_time = cari_kolom_otomatis(df_resp, time_keys) or df_resp.columns[0]
+    # safe fallback to avoid index errors
+    def col_or(index, df):
+        try:
+            return df.columns[index]
+        except:
+            return df.columns[0]
+
+    col_name = cari_kolom_otomatis(df_resp, name_keys) or col_or(2, df_resp)
+    col_score = cari_kolom_otomatis(df_resp, score_keys) or col_or(1, df_resp)
+    col_time = cari_kolom_otomatis(df_resp, time_keys) or col_or(0, df_resp)
     col_absen = cari_kolom_otomatis(df_resp, absen_keys)
 
-    kolom_nama_hasil = cari_kolom_otomatis(df_hasil, name_keys) or df_hasil.columns[1]
-    kolom_absen_hasil = cari_kolom_otomatis(df_hasil, absen_keys) or df_hasil.columns[0]
+    kolom_nama_hasil = cari_kolom_otomatis(df_hasil, name_keys) or col_or(1, df_hasil)
+    kolom_absen_hasil = cari_kolom_otomatis(df_hasil, absen_keys) or col_or(0, df_hasil)
 
     # normalize
     df_resp["_name_norm"] = df_resp[col_name].apply(normalize_text)
     df_hasil["_name_norm"] = df_hasil[kolom_nama_hasil].apply(normalize_text)
-    df_resp["_absen_str"] = df_resp[col_absen].astype(str).fillna("").str.strip() if col_absen in df_resp.columns else ""
+    if col_absen in df_resp.columns:
+        df_resp["_absen_str"] = df_resp[col_absen].astype(str).fillna("").str.strip()
+    else:
+        df_resp["_absen_str"] = ""
     df_hasil["_absen_str"] = df_hasil[kolom_absen_hasil].astype(str).fillna("").str.strip()
 
     # siapkan kolom Score_1..6
@@ -184,12 +191,21 @@ def match_and_write(respons_path, hasil_path, log_fn=None, progress_fn=None):
     df_hasil.drop(columns=["_name_norm", "_absen_str"], inplace=True, errors="ignore")
     df_hasil.to_excel(out_path, index=False)
 
-    # Pewarnaan skor otomatis
+    # Pewarnaan skor otomatis (openpyxl)
     wb = load_workbook(out_path)
     ws = wb.active
+    # cari kolom Score_1..Score_6 dalam sheet (asumsi mulai dari kolom mana pun)
+    headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    # cari index kolom Score_1..6
+    score_cols_idx = []
+    for i, h in enumerate(headers, start=1):
+        if h and isinstance(h, str) and h.strip().startswith("Score_"):
+            score_cols_idx.append(i)
+    # apply warna ke setiap row
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        for i in range(3, 9):  # Score_1 sampai Score_6
-            apply_color(row[i - 1], row[i - 1].value)
+        for idx in score_cols_idx:
+            cell = row[idx - 1]
+            apply_color(cell, cell.value)
     wb.save(out_path)
 
     log(f"✅ Selesai! File disimpan di: {out_path}")
@@ -198,91 +214,143 @@ def match_and_write(respons_path, hasil_path, log_fn=None, progress_fn=None):
     return out_path
 
 # ---------------------------------------------------------
-# GUI Modern
+# Streamlit UI
 # ---------------------------------------------------------
-class MatcherGUI(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("MB Tools — Pencocokan Nilai Siswa (FINAL+ Stable)")
-        self.geometry("760x520")
-        self.configure(bg="#f3f7fb")
+st.set_page_config(page_title="MB Tools — Pencocokan Nilai Siswa", layout="wide")
 
-        header = tk.Frame(self, bg="#1f6feb", height=90)
-        header.pack(fill="x")
-        tk.Label(header, text="📊 Pencocokan Nilai Siswa — MB Tools", bg="#1f6feb", fg="white",
-                 font=("Segoe UI", 18, "bold")).place(x=20, y=18)
-        tk.Label(header, text="Credit Apps by MB — Donasi: 08522939579", bg="#1f6feb", fg="white",
-                 font=("Segoe UI", 9)).place(x=22, y=50)
+# Header
+st.markdown(
+    """
+    <div style="background:#1f6feb;padding:18px;border-radius:8px">
+      <h2 style="color:white;margin:0">📊 MB Tools — Pencocokan Nilai Siswa (Streamlit)</h2>
+      <div style="color:#e6f0ff">Credit: Apps by MB — Donasi: wa.me/628522939579</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-        body = tk.Frame(self, bg=self["bg"])
-        body.pack(fill="both", expand=True, padx=18, pady=12)
+st.write("")  # spacer
 
-        tk.Button(body, text="📂 Pilih File Respons", command=self.pick_respons).grid(row=0, column=0, sticky="w", pady=8)
-        self.lbl_respons = tk.Entry(body, width=72)
-        self.lbl_respons.grid(row=0, column=1, padx=8, pady=8)
+# Two-column uploader layout
+col1, col2 = st.columns([1, 1])
 
-        tk.Button(body, text="📘 Pilih File Hasil", command=self.pick_hasil).grid(row=1, column=0, sticky="w", pady=8)
-        self.lbl_hasil = tk.Entry(body, width=72)
-        self.lbl_hasil.grid(row=1, column=1, padx=8, pady=8)
-
-        self.btn_process = tk.Button(body, text="🚀 Proses Data", bg="#0b78e3", fg="white", command=self.start_process)
-        self.btn_process.grid(row=2, column=1, sticky="w", pady=10)
-
-        self.progress = ttk.Progressbar(body, orient="horizontal", length=640, mode="determinate")
-        self.progress.grid(row=3, column=0, columnspan=2, pady=8)
-        self.lbl_pct = tk.Label(body, text="0%", bg=self["bg"])
-        self.lbl_pct.grid(row=4, column=0, sticky="w", pady=2)
-
-        tk.Label(body, text="Log:", bg=self["bg"]).grid(row=5, column=0, sticky="w")
-        self.txt_log = tk.Text(body, height=14, width=92)
-        self.txt_log.grid(row=6, column=0, columnspan=2, pady=6)
-
-    def pick_respons(self):
-        p = filedialog.askopenfilename(title="Pilih file respons", filetypes=[("Excel files", "*.xlsx *.xls")])
-        if p:
-            self.lbl_respons.delete(0, tk.END)
-            self.lbl_respons.insert(0, p)
-
-    def pick_hasil(self):
-        p = filedialog.askopenfilename(title="Pilih file hasil", filetypes=[("Excel files", "*.xlsx *.xls")])
-        if p:
-            self.lbl_hasil.delete(0, tk.END)
-            self.lbl_hasil.insert(0, p)
-
-    def log(self, msg):
-        timestamp = time.strftime("%H:%M:%S")
-        self.txt_log.insert(tk.END, f"[{timestamp}] {msg}\n")
-        self.txt_log.see(tk.END)
-        self.update_idletasks()
-
-    def set_progress(self, pct):
-        self.progress["value"] = pct
-        self.lbl_pct.config(text=f"{pct}%")
-        self.update_idletasks()
-
-    def start_process(self):
-        respons = self.lbl_respons.get().strip()
-        hasil = self.lbl_hasil.get().strip()
-        if not respons or not hasil:
-            messagebox.showwarning("File belum lengkap", "Silakan pilih file respons dan hasil terlebih dahulu.")
-            return
-
-        self.btn_process.config(state="disabled")
-        self.txt_log.delete("1.0", tk.END)
-        threading.Thread(target=self._run_match, args=(respons, hasil), daemon=True).start()
-
-    def _run_match(self, respons, hasil):
+with col1:
+    st.subheader("📂 File Respons (upload)")
+    uploaded_respons = st.file_uploader("Pilih file respons (Excel)", type=["xlsx", "xls"], key="resp")
+    if uploaded_respons:
         try:
-            out = match_and_write(respons, hasil, log_fn=self.log, progress_fn=self.set_progress)
-            messagebox.showinfo("Selesai", f"✅ Proses selesai!\nFile tersimpan di:\n{out}")
+            df_preview_resp = pd.read_excel(uploaded_respons, engine="openpyxl", nrows=5)
+            st.markdown("**Preview (5 baris pertama)**")
+            st.dataframe(df_preview_resp)
         except Exception as e:
-            messagebox.showerror("Error", str(e))
-            self.log(f"❌ ERROR: {e}")
-        finally:
-            self.btn_process.config(state="normal")
-            self.set_progress(0)
+            st.warning(f"Gagal membaca preview respons: {e}")
 
-if __name__ == "__main__":
-    app = MatcherGUI()
-    app.mainloop()
+with col2:
+    st.subheader("📘 File Hasil (upload)")
+    uploaded_hasil = st.file_uploader("Pilih file hasil (Excel) — template kelas", type=["xlsx", "xls"], key="hasil")
+    if uploaded_hasil:
+        try:
+            df_preview_hasil = pd.read_excel(uploaded_hasil, engine="openpyxl", nrows=5)
+            st.markdown("**Preview (5 baris pertama)**")
+            st.dataframe(df_preview_hasil)
+        except Exception as e:
+            st.warning(f"Gagal membaca preview hasil: {e}")
 
+st.write("")  # spacer
+
+# Options and action
+col_a, col_b, col_c = st.columns([1, 1, 2])
+with col_a:
+    auto_rename = st.checkbox("Auto-rename output with timestamp", value=True)
+with col_b:
+    show_log_detail = st.checkbox("Tampilkan log detail", value=True)
+
+with col_c:
+    st.write("")  # align
+    process_btn = st.button("🚀 Proses Data", use_container_width=True)
+
+# Log & progress UI placeholders
+log_box = st.empty()
+progress_container = st.empty()
+
+# Helper to save uploaded file to temp path
+def save_uploaded_to_temp(uploaded_file, prefix):
+    if uploaded_file is None:
+        return None
+    # ensure temp dir
+    tmpdir = tempfile.mkdtemp(prefix="mbtools_")
+    ext = os.path.splitext(uploaded_file.name)[1] or ".xlsx"
+    tmp_path = os.path.join(tmpdir, prefix + ext)
+    # write bytes
+    with open(tmp_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return tmp_path
+
+# Run process when button clicked
+if process_btn:
+    if not uploaded_respons or not uploaded_hasil:
+        st.warning("Silakan upload kedua file (Respons & Hasil) terlebih dahulu.")
+    else:
+        logs = []
+        def log_fn(msg):
+            # append timestamp
+            ts = datetime.now().strftime("%H:%M:%S")
+            entry = f"[{ts}] {msg}"
+            logs.append(entry)
+            if show_log_detail:
+                log_box.text("\n".join(logs[-200:]))
+            else:
+                # only show last 6 entries
+                log_box.text("\n".join(logs[-6:]))
+
+        prog_bar = progress_container.progress(0)
+        pct_text = progress_container.empty()
+
+        def progress_fn(p):
+            try:
+                prog_bar.progress(p)
+                pct_text.text(f"{p}%")
+            except Exception:
+                pass
+
+        # Save uploaded files to disk so match_and_write can open them
+        try:
+            path_resp = save_uploaded_to_temp(uploaded_respons, "respons")
+            path_hasil = save_uploaded_to_temp(uploaded_hasil, "hasil")
+            if auto_rename:
+                # ensure output goes to the hasil temp folder
+                # match_and_write will write hasil_pencocokan.xlsx in same dir as hasil_path
+                out_dir = os.path.dirname(path_hasil)
+                # call
+                out_path = match_and_write(path_resp, path_hasil, log_fn=log_fn, progress_fn=progress_fn)
+            else:
+                out_path = match_and_write(path_resp, path_hasil, log_fn=log_fn, progress_fn=progress_fn)
+        except Exception as e:
+            st.error(f"❌ Terjadi error saat memproses: {e}")
+            log_fn(f"ERROR: {e}")
+            prog_bar.progress(0)
+            pct_text.text("")
+        else:
+            st.success("✅ Proses selesai!")
+            log_fn(f"File output: {out_path}")
+            # read file bytes for download
+            try:
+                with open(out_path, "rb") as f:
+                    data = f.read()
+                # create a nicer filename for download
+                fname = "hasil_pencocokan.xlsx"
+                if auto_rename:
+                    tstamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    fname = f"hasil_pencocokan_{tstamp}.xlsx"
+                st.download_button("⬇️ Download Hasil Pencocokan", data, file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            except Exception as e:
+                st.warning(f"Gagal menyediakan download: {e}")
+
+        # finally show last logs
+        if show_log_detail:
+            log_box.text("\n".join(logs[-200:]))
+        else:
+            log_box.text("\n".join(logs[-20:]))
+
+st.write("")  # bottom spacer
+st.markdown("<small>Apps by MB — Donasi/Support: wa.me/628522939579</small>", unsafe_allow_html=True)
