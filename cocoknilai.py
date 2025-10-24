@@ -1,252 +1,208 @@
-# cocoknilai.py
+# cocoknilai_csv.py
 """
-MB Tools - Pencocokan Nilai Siswa (Streamlit minimal)
-Mode: Upload → Proses → Download
-Tanpa tkinter, tanpa rapidfuzz. Fuzzy matching menggunakan difflib (built-in).
-Jika openpyxl tersedia, hasil ditulis ke .xlsx. Jika tidak, ditulis .csv.
+MB Tools - Cocok Nilai (CSV)
+- Input: 2x CSV (jawaban siswa & kunci)
+- Deteksi kolom otomatis (sesuai format contoh)
+- 1 poin per jawaban benar (case-insensitive, trim)
+- Preview, hasil, dan download CSV hasil
 """
 
-import os
+import io
 import tempfile
 from datetime import datetime
 
 import streamlit as st
 import pandas as pd
-from difflib import SequenceMatcher
 
-# Try to import openpyxl for nicer .xlsx output; if not available we'll fallback to CSV
-try:
-    import openpyxl  # only to detect availability
-    HAS_OPENPYXL = True
-except Exception:
-    HAS_OPENPYXL = False
-
-st.set_page_config(page_title="MB Tools — Cocok Nilai (Minimal)", layout="wide")
+st.set_page_config(page_title="MB Tools - Cocok Nilai (CSV)", layout="wide")
 
 st.markdown(
-    "<h2>📊 MB Tools — Pencocokan Nilai Siswa (Minimal)</h2>"
-    "<div style='color:gray'>Upload 2 file Excel (Respons & Hasil), klik Proses, lalu download hasil.</div>",
-    unsafe_allow_html=True,
+    """
+    <div style="background:#1f6feb;padding:12px;border-radius:8px">
+      <h2 style="color:white;margin:0">📊 MB Tools — Cocok Nilai (CSV)</h2>
+      <div style="color:#e6f0ff">Upload CSV Jawaban Siswa & CSV Kunci → proses → download hasil</div>
+    </div>
+    """,
+    unsafe_allow_html=True
 )
 
-st.write("")  # spacer
-
-col1, col2 = st.columns(2)
+st.write("")
+col1, col2 = st.columns([1, 1])
 with col1:
-    uploaded_resp = st.file_uploader("Upload file Respons (Excel)", type=["xlsx", "xls"], key="resp")
+    uploaded_siswa = st.file_uploader("Upload CSV Jawaban Siswa (contoh: NIS, Nama, No1, No2, ...)", type=["csv"], key="siswa")
 with col2:
-    uploaded_hasil = st.file_uploader("Upload file Hasil (Excel) — template daftar siswa", type=["xlsx", "xls"], key="hasil")
+    uploaded_kunci = st.file_uploader("Upload CSV Kunci Jawaban (contoh: No, Kunci) atau single-row Kunci", type=["csv"], key="kunci")
 
-st.write("")  # spacer
+st.write("")
+opts_col1, opts_col2 = st.columns([1, 2])
+with opts_col1:
+    rename_opt = st.checkbox("Auto-rename output (timestamp)", value=True)
+with opts_col2:
+    st.caption("Deteksi otomatis kolom pertanyaan. Sistem memberi 1 poin per jawaban yang cocok (case-insensitive).")
 
-# Simple options
-rename_opt = st.checkbox("Auto-rename output with timestamp (recommended)", value=True)
-process_btn = st.button("🚀 Proses Data")
+process_btn = st.button("🚀 Proses & Hitung Nilai", use_container_width=True)
 
-# Helpers (same logic)
-def parse_score(raw):
-    if pd.isna(raw):
-        return None
-    s = str(raw).strip()
-    if "/" in s:
-        s = s.split("/")[0].strip()
-    if s.endswith("%"):
-        s = s[:-1].strip()
-    cleaned = "".join(ch for ch in s if (ch.isdigit() or ch in ".,"))
-    cleaned = cleaned.replace(",", ".")
+def normalize_answer(x):
     try:
-        return float(cleaned)
+        if pd.isna(x):
+            return ""
+        return str(x).strip().upper()
     except:
-        return None
+        return str(x).strip().upper()
 
-def normalize_text(s):
-    if pd.isna(s):
-        return ""
-    return " ".join(str(s).strip().lower().split())
+def detect_question_columns(df_siswa):
+    # Heuristik: kolom yang bukan 'nis','nama','no','id' dianggap kolom soal
+    low = [str(c).strip().lower() for c in df_siswa.columns]
+    ignore = set(["nis", "nama", "name", "no", "id", "nomor", "kelas"])
+    q_cols = [c for c, l in zip(df_siswa.columns, low) if l not in ignore]
+    # if first two columns are NIS & Nama, skip them; otherwise if many columns, take columns from 3..end
+    if len(df_siswa.columns) >= 3 and (low[0] in ["nis", "id", "no"] or low[1] in ["nama", "name"]):
+        # assume question cols start at index 2 (0-based)
+        q_cols = list(df_siswa.columns[2:])
+    return q_cols
 
-def cari_kolom_otomatis(df, keywords):
-    cols = list(df.columns)
-    for kw in keywords:
-        for col in cols:
-            name = str(col).strip().lower()
-            if kw in name:
-                return col
-    return None
+def load_kunci_from_df(df_kunci, q_cols):
+    """
+    Support two kunci formats:
+    1) Two-column table: 'No' | 'Kunci' (No numeric)
+    2) Single row header: columns named 1,2,3 or No1,No2 ...
+    3) One-row where first row contains kunci values (e.g., header generic)
+    """
+    # 1) try two-column detection
+    cols = [str(c).strip().lower() for c in df_kunci.columns]
+    if len(df_kunci.columns) >= 2 and any("kunci" in c for c in cols) or ("jawaban" in "".join(cols)):
+        # try to find kunci column
+        # find index of "kunci" like column
+        kidx = None
+        noidx = None
+        for i, c in enumerate(cols):
+            if "kunci" in c or "jawaban" in c or "answer" in c:
+                kidx = i
+            if c in ("no", "nomor", "index", "no."):
+                noidx = i
+        if kidx is not None:
+            # build dict: no -> kunci
+            try:
+                ser_no = df_kunci.iloc[:, noidx] if noidx is not None else pd.Series(range(1, len(df_kunci)+1))
+                ser_k = df_kunci.iloc[:, kidx]
+                mapping = {}
+                for i, (n, k) in enumerate(zip(ser_no, ser_k)):
+                    keynum = str(int(n)) if pd.notna(n) and str(n).strip().isdigit() else str(i+1)
+                    mapping[keynum] = normalize_answer(k)
+                return mapping
+            except Exception:
+                pass
 
-def similarity_pct(a, b):
-    if not a and not b:
-        return 100.0
-    return SequenceMatcher(None, a, b).ratio() * 100.0
+    # 2) try single row with question-number headers matching q_cols length
+    # If df_kunci has one row and many columns, treat as answers row
+    if df_kunci.shape[0] == 1 and df_kunci.shape[1] >= 1:
+        mapping = {}
+        # if headers look numeric or "No1" style, use headers; else use ordinal 1..n
+        headers = list(df_kunci.columns)
+        for i, h in enumerate(headers):
+            num = None
+            hn = str(h).strip()
+            # try extract number
+            import re
+            m = re.search(r"(\d+)", hn)
+            if m:
+                num = m.group(1)
+            else:
+                num = str(i+1)
+            mapping[num] = normalize_answer(df_kunci.iloc[0, i])
+        return mapping
 
-def match_df_bytes(df_resp, df_hasil, log_fn=None):
-    # core logic adapted to use DataFrame objects (no file IO here)
-    def log(msg):
-        if log_fn:
-            log_fn(msg)
+    # 3) fallback: if q_cols provided, try to match by position
+    if len(q_cols) > 0:
+        mapping = {}
+        # if kunci file has single column of values, map by order
+        flat = []
+        # flatten all cells row-wise
+        for _, row in df_kunci.iterrows():
+            for v in row:
+                flat.append(v)
+        for i, v in enumerate(flat):
+            mapping[str(i+1)] = normalize_answer(v)
+        return mapping
 
-    name_keys = ["nama", "name"]
-    score_keys = ["score", "nilai", "skor"]
-    absen_keys = ["absen", "no", "nomor", "nis", "id"]
-    time_keys = ["time", "timestamp", "tgl", "waktu"]
+    # final fallback: empty mapping
+    return {}
 
-    # safe fallbacks
-    def col_or(index, df):
-        try:
-            return df.columns[index]
-        except:
-            return df.columns[0]
+def build_result(df_siswa, kunci_map, q_cols):
+    # kunci_map keys likely are "1","2",... ; q_cols are column names in df_siswa
+    results = []
+    # create per-question correctness columns
+    for _, row in df_siswa.iterrows():
+        row_result = row.to_dict()
+        total = 0
+        perq = {}
+        # iterate over question columns in order
+        for i, col in enumerate(q_cols, start=1):
+            qnum = str(i)
+            student_ans = normalize_answer(row.get(col, ""))
+            key = kunci_map.get(qnum, "")
+            correct = 1 if (student_ans != "" and key != "" and student_ans == key) else 0
+            perq[col] = correct
+            total += correct
+            # also store normalized answers and key for debugging if needed
+            row_result[f"ans_{qnum}"] = student_ans
+            row_result[f"key_{qnum}"] = key
+            row_result[f"ok_{qnum}"] = correct
+        row_result["TOTAL_BENAR"] = total
+        row_result["PERSENTASE"] = round((total / max(len(q_cols),1)) * 100, 2)
+        results.append(row_result)
+    res_df = pd.DataFrame(results)
+    # order columns: keep original NIS/Nama first if present, then per-question columns, then totals
+    # We will not reorder aggressively; just return the DF
+    return res_df
 
-    col_name = cari_kolom_otomatis(df_resp, name_keys) or col_or(2, df_resp)
-    col_score = cari_kolom_otomatis(df_resp, score_keys) or col_or(1, df_resp)
-    col_time = cari_kolom_otomatis(df_resp, time_keys) or col_or(0, df_resp)
-    col_absen = cari_kolom_otomatis(df_resp, absen_keys)
-
-    kolom_nama_hasil = cari_kolom_otomatis(df_hasil, name_keys) or col_or(1, df_hasil)
-    kolom_absen_hasil = cari_kolom_otomatis(df_hasil, absen_keys) or col_or(0, df_hasil)
-
-    # normalize
-    df_resp = df_resp.copy()
-    df_hasil = df_hasil.copy()
-    df_resp["_name_norm"] = df_resp[col_name].apply(normalize_text)
-    df_hasil["_name_norm"] = df_hasil[kolom_nama_hasil].apply(normalize_text)
-    if col_absen in df_resp.columns:
-        df_resp["_absen_str"] = df_resp[col_absen].astype(str).fillna("").str.strip()
-    else:
-        df_resp["_absen_str"] = ""
-    df_hasil["_absen_str"] = df_hasil[kolom_absen_hasil].astype(str).fillna("").str.strip()
-
-    # ensure Score_1..6 exist
-    for i in range(1, 7):
-        colname = f"Score_{i}"
-        if colname not in df_hasil.columns:
-            df_hasil[colname] = pd.NA
-
-    total_resp = len(df_resp)
-    processed = 0
-
-    # matching loop
-    for ridx, rrow in df_resp.iterrows():
-        processed += 1
-        raw_name = rrow["_name_norm"]
-        raw_absen = str(rrow["_absen_str"])
-        raw_score = parse_score(rrow[col_score])
-
-        matched_idx = None
-
-        # exact/substring name
-        for hid, target_norm in df_hasil["_name_norm"].items():
-            if raw_name == target_norm or raw_name in target_norm or target_norm in raw_name:
-                matched_idx = hid
-                break
-
-        # match by absen
-        if matched_idx is None and raw_absen:
-            for hid, a in df_hasil["_absen_str"].items():
-                if str(a).strip() == raw_absen.strip():
-                    matched_idx = hid
-                    break
-
-        # fuzzy by difflib
-        if matched_idx is None and raw_name:
-            best_score = 0
-            best_idx = None
-            for hid, target_norm in df_hasil["_name_norm"].items():
-                sc = similarity_pct(raw_name, target_norm)
-                if sc > best_score:
-                    best_score = sc
-                    best_idx = hid
-            if best_score >= 65:
-                matched_idx = best_idx
-
-        if matched_idx is None:
-            log(f"⚠️ Tidak ditemukan: {rrow[col_name]}")
-            continue
-
-        # place into next empty Score_1..6
-        for i in range(1, 7):
-            coln = f"Score_{i}"
-            val = df_hasil.at[matched_idx, coln]
-            if pd.isna(val) or str(val).strip() == "":
-                df_hasil.at[matched_idx, coln] = raw_score
-                break
-
-    # compute SCORE per Bayu logic
-    def safe_float(x):
-        try:
-            return float(x)
-        except:
-            return None
-
-    def hitung_score(row):
-        skor_list = [safe_float(row.get(f"Score_{i}")) for i in range(1, 7)]
-        s1 = skor_list[0]
-        if s1 and s1 >= 80:
-            return s1
-        elif any(s and s >= 80 for s in skor_list[1:]):
-            return 78
-        return None
-
-    df_hasil["SCORE"] = df_hasil.apply(hitung_score, axis=1)
-
-    # drop helper cols
-    for c in ["_name_norm", "_absen_str"]:
-        if c in df_hasil.columns:
-            df_hasil.drop(columns=[c], inplace=True)
-
-    return df_hasil
-
-# Processing action
 if process_btn:
-    if not uploaded_resp or not uploaded_hasil:
-        st.warning("Silakan upload kedua file (Respons & Hasil) terlebih dahulu.")
+    if (not uploaded_siswa) or (not uploaded_kunci):
+        st.warning("Upload kedua file CSV (siswa & kunci) terlebih dahulu.")
     else:
         try:
-            # read uploaded files to DataFrames
-            df_resp = pd.read_excel(uploaded_resp, engine="openpyxl") if uploaded_resp.name.lower().endswith(("xlsx","xls")) else pd.read_csv(uploaded_resp)
-            df_hasil = pd.read_excel(uploaded_hasil, engine="openpyxl") if uploaded_hasil.name.lower().endswith(("xlsx","xls")) else pd.read_csv(uploaded_hasil)
+            # read CSVs
+            df_siswa = pd.read_csv(uploaded_siswa)
+            df_kunci = pd.read_csv(uploaded_kunci)
 
-            st.info("Memproses... (ini mungkin memakan beberapa detik tergantung ukuran file)")
+            st.info("File terbaca. Mendeteksi kolom soal...")
 
-            # simple logger collector
-            log_msgs = []
-            def log_fn(msg):
-                log_msgs.append(msg)
+            q_cols = detect_question_columns(df_siswa)
+            if not q_cols:
+                st.error("Gagal mendeteksi kolom soal pada file siswa. Pastikan format: NIS, Nama, No1, No2, ... atau set kolom soal dimulai kolom ke-3.")
+                st.stop()
 
-            result_df = match_df_bytes(df_resp, df_hasil, log_fn=log_fn)
+            st.success(f"Terdeteksi {len(q_cols)} kolom soal. Contoh kolom: {q_cols[:6]}")
 
-            # prepare output file (xlsx if openpyxl available, else csv)
+            # load kunci
+            kmap = load_kunci_from_df(df_kunci, q_cols)
+            if not kmap:
+                st.warning("Gagal mendeteksi kunci otomatis. Pastikan kunci dalam format 'No,Kunci' atau single-row kunci.")
+                # show preview of kunci for debugging
+                st.markdown("**Preview Kunci (file kunci)**")
+                st.dataframe(df_kunci.head(8))
+            else:
+                st.success(f"Kunci terdeteksi untuk {len(kmap)} soal (menggunakan nomor soal sebagai urutan).")
+
+            # build result
+            res_df = build_result(df_siswa, kmap, q_cols)
+
+            # prepare download
             out_name = "hasil_pencocokan"
             if rename_opt:
                 tstamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 out_name = f"{out_name}_{tstamp}"
-            tmpdir = tempfile.mkdtemp(prefix="mbtools_")
-            out_path_xlsx = os.path.join(tmpdir, out_name + ".xlsx")
-            out_path_csv = os.path.join(tmpdir, out_name + ".csv")
+            csv_bytes = res_df.to_csv(index=False).encode("utf-8")
 
-            if HAS_OPENPYXL:
-                # write xlsx
-                result_df.to_excel(out_path_xlsx, index=False, engine="openpyxl")
-                with open(out_path_xlsx, "rb") as f:
-                    data = f.read()
-                st.success("✅ Proses selesai! (output: .xlsx)")
-                st.download_button("⬇️ Download hasil_pencocokan.xlsx", data, file_name=os.path.basename(out_path_xlsx), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            else:
-                # fallback CSV
-                result_df.to_csv(out_path_csv, index=False)
-                with open(out_path_csv, "rb") as f:
-                    data = f.read()
-                st.success("✅ Proses selesai! (openpyxl tidak terpasang — output: .csv)")
-                st.download_button("⬇️ Download hasil_pencocokan.csv", data, file_name=os.path.basename(out_path_csv), mime="text/csv")
+            st.success("✅ Proses selesai — hasil siap diunduh.")
+            st.download_button("⬇️ Download Hasil (CSV)", csv_bytes, file_name=out_name + ".csv", mime="text/csv")
 
-            # show short preview of results
             st.markdown("**Preview hasil (5 baris pertama)**")
-            st.dataframe(result_df.head(5))
+            st.dataframe(res_df.head(10))
 
-            # show logs (if any)
-            if log_msgs:
-                st.markdown("**Log**")
-                for m in log_msgs[-50:]:
-                    st.write(m)
+            # also show simple summary (class average)
+            avg = res_df["PERSENTASE"].mean() if "PERSENTASE" in res_df.columns else None
+            st.markdown(f"**Rata-rata kelas:** {round(avg,2)}%") if avg is not None else None
 
         except Exception as e:
             st.error(f"Terjadi error saat memproses: {e}")
