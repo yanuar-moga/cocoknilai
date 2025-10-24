@@ -1,25 +1,49 @@
 # cocoknilai.py
 """
-MB Tools - Pencocokan Nilai Siswa (Streamlit)
-Converted for Streamlit by ChatGPT for Bayu
-- Menggunakan difflib (built-in) sebagai pengganti rapidfuzz
-- Upload 2 file Excel (Respons & Hasil), proses, dan download hasil_pencocokan.xlsx
+MB Tools - Pencocokan Nilai Siswa (Streamlit minimal)
+Mode: Upload → Proses → Download
+Tanpa tkinter, tanpa rapidfuzz. Fuzzy matching menggunakan difflib (built-in).
+Jika openpyxl tersedia, hasil ditulis ke .xlsx. Jika tidak, ditulis .csv.
 """
 
 import os
 import tempfile
 from datetime import datetime
-import io
 
 import streamlit as st
 import pandas as pd
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
 from difflib import SequenceMatcher
 
-# -------------------------
-# Helpers
-# -------------------------
+# Try to import openpyxl for nicer .xlsx output; if not available we'll fallback to CSV
+try:
+    import openpyxl  # only to detect availability
+    HAS_OPENPYXL = True
+except Exception:
+    HAS_OPENPYXL = False
+
+st.set_page_config(page_title="MB Tools — Cocok Nilai (Minimal)", layout="wide")
+
+st.markdown(
+    "<h2>📊 MB Tools — Pencocokan Nilai Siswa (Minimal)</h2>"
+    "<div style='color:gray'>Upload 2 file Excel (Respons & Hasil), klik Proses, lalu download hasil.</div>",
+    unsafe_allow_html=True,
+)
+
+st.write("")  # spacer
+
+col1, col2 = st.columns(2)
+with col1:
+    uploaded_resp = st.file_uploader("Upload file Respons (Excel)", type=["xlsx", "xls"], key="resp")
+with col2:
+    uploaded_hasil = st.file_uploader("Upload file Hasil (Excel) — template daftar siswa", type=["xlsx", "xls"], key="hasil")
+
+st.write("")  # spacer
+
+# Simple options
+rename_opt = st.checkbox("Auto-rename output with timestamp (recommended)", value=True)
+process_btn = st.button("🚀 Proses Data")
+
+# Helpers (same logic)
 def parse_score(raw):
     if pd.isna(raw):
         return None
@@ -54,44 +78,18 @@ def similarity_pct(a, b):
         return 100.0
     return SequenceMatcher(None, a, b).ratio() * 100.0
 
-def apply_color(cell, value):
-    if value is None:
-        return
-    try:
-        val = float(value)
-    except:
-        return
-    if val < 78:
-        cell.fill = PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")  # merah
-    elif val < 80:
-        cell.fill = PatternFill(start_color="FFF58C", end_color="FFF58C", fill_type="solid")  # kuning
-    else:
-        cell.fill = PatternFill(start_color="B7E1A1", end_color="B7E1A1", fill_type="solid")  # hijau
-
-# -------------------------
-# Core logic (file paths)
-# -------------------------
-def match_and_write(respons_path, hasil_path, log_fn=None, progress_fn=None):
+def match_df_bytes(df_resp, df_hasil, log_fn=None):
+    # core logic adapted to use DataFrame objects (no file IO here)
     def log(msg):
         if log_fn:
             log_fn(msg)
-        else:
-            print(msg)
-
-    log("🔁 Membaca file Excel...")
-    df_resp = pd.read_excel(respons_path, engine="openpyxl")
-    df_hasil = pd.read_excel(hasil_path, engine="openpyxl")
-
-    # deteksi kolom
-    resp_cols_original = list(df_resp.columns)
-    hasil_cols_original = list(df_hasil.columns)
 
     name_keys = ["nama", "name"]
     score_keys = ["score", "nilai", "skor"]
     absen_keys = ["absen", "no", "nomor", "nis", "id"]
     time_keys = ["time", "timestamp", "tgl", "waktu"]
 
-    # safe fallback
+    # safe fallbacks
     def col_or(index, df):
         try:
             return df.columns[index]
@@ -107,6 +105,8 @@ def match_and_write(respons_path, hasil_path, log_fn=None, progress_fn=None):
     kolom_absen_hasil = cari_kolom_otomatis(df_hasil, absen_keys) or col_or(0, df_hasil)
 
     # normalize
+    df_resp = df_resp.copy()
+    df_hasil = df_hasil.copy()
     df_resp["_name_norm"] = df_resp[col_name].apply(normalize_text)
     df_hasil["_name_norm"] = df_hasil[kolom_nama_hasil].apply(normalize_text)
     if col_absen in df_resp.columns:
@@ -115,7 +115,7 @@ def match_and_write(respons_path, hasil_path, log_fn=None, progress_fn=None):
         df_resp["_absen_str"] = ""
     df_hasil["_absen_str"] = df_hasil[kolom_absen_hasil].astype(str).fillna("").str.strip()
 
-    # siapkan kolom Score_1..6 jika belum ada
+    # ensure Score_1..6 exist
     for i in range(1, 7):
         colname = f"Score_{i}"
         if colname not in df_hasil.columns:
@@ -124,32 +124,29 @@ def match_and_write(respons_path, hasil_path, log_fn=None, progress_fn=None):
     total_resp = len(df_resp)
     processed = 0
 
-    log("🔁 Mencocokkan data siswa...")
+    # matching loop
     for ridx, rrow in df_resp.iterrows():
         processed += 1
-        if progress_fn:
-            progress_fn(int(processed / max(total_resp, 1) * 100))
-
         raw_name = rrow["_name_norm"]
         raw_absen = str(rrow["_absen_str"])
         raw_score = parse_score(rrow[col_score])
 
         matched_idx = None
 
-        # 1) nama exact / substring
+        # exact/substring name
         for hid, target_norm in df_hasil["_name_norm"].items():
             if raw_name == target_norm or raw_name in target_norm or target_norm in raw_name:
                 matched_idx = hid
                 break
 
-        # 2) cocokkan absen
+        # match by absen
         if matched_idx is None and raw_absen:
             for hid, a in df_hasil["_absen_str"].items():
                 if str(a).strip() == raw_absen.strip():
                     matched_idx = hid
                     break
 
-        # 3) fuzzy using difflib
+        # fuzzy by difflib
         if matched_idx is None and raw_name:
             best_score = 0
             best_idx = None
@@ -165,7 +162,7 @@ def match_and_write(respons_path, hasil_path, log_fn=None, progress_fn=None):
             log(f"⚠️ Tidak ditemukan: {rrow[col_name]}")
             continue
 
-        # isi ke Score_1..6 pada baris hasil
+        # place into next empty Score_1..6
         for i in range(1, 7):
             coln = f"Score_{i}"
             val = df_hasil.at[matched_idx, coln]
@@ -173,8 +170,7 @@ def match_and_write(respons_path, hasil_path, log_fn=None, progress_fn=None):
                 df_hasil.at[matched_idx, coln] = raw_score
                 break
 
-    # hitung SCORE sesuai aturan Bayu
-    log("🧮 Menghitung kolom SCORE otomatis...")
+    # compute SCORE per Bayu logic
     def safe_float(x):
         try:
             return float(x)
@@ -192,147 +188,66 @@ def match_and_write(respons_path, hasil_path, log_fn=None, progress_fn=None):
 
     df_hasil["SCORE"] = df_hasil.apply(hitung_score, axis=1)
 
-    # simpan hasil ke temp file
-    out_dir = os.path.dirname(os.path.abspath(hasil_path))
-    out_name = os.path.join(out_dir, "hasil_pencocokan.xlsx")
-    df_save = df_hasil.copy()
+    # drop helper cols
     for c in ["_name_norm", "_absen_str"]:
-        if c in df_save.columns:
-            df_save.drop(columns=[c], inplace=True)
-    df_save.to_excel(out_name, index=False)
+        if c in df_hasil.columns:
+            df_hasil.drop(columns=[c], inplace=True)
 
-    # pewarnaan Score_1..Score_6 (openpyxl)
-    try:
-        wb = load_workbook(out_name)
-        ws = wb.active
-        headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
-        score_cols_idx = []
-        for i, h in enumerate(headers, start=1):
-            if h and isinstance(h, str) and h.strip().lower().startswith("score_"):
-                score_cols_idx.append(i)
-        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-            for idx in score_cols_idx:
-                cell = row[idx - 1]
-                apply_color(cell, cell.value)
-        wb.save(out_name)
-    except Exception as e:
-        log(f"⚠️ Pewarnaan gagal: {e}")
+    return df_hasil
 
-    log(f"✅ Selesai! File disimpan di: {out_name}")
-    if progress_fn:
-        progress_fn(100)
-    return out_name
-
-# -------------------------
-# Streamlit UI
-# -------------------------
-st.set_page_config(page_title="MB Tools — Pencocokan Nilai Siswa", layout="wide")
-
-st.markdown(
-    """
-    <div style="background:#1f6feb;padding:14px;border-radius:8px">
-      <h2 style="color:white;margin:0">📊 MB Tools — Pencocokan Nilai Siswa</h2>
-      <div style="color:#e6f0ff">Credit: Apps by MB — Donasi: wa.me/628522939579</div>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
-st.write("")  # spacer
-
-col1, col2 = st.columns([1, 1])
-
-with col1:
-    st.subheader("📂 Upload File Respons")
-    uploaded_resp = st.file_uploader("Pilih file respons (Excel)", type=["xlsx", "xls"], key="resp")
-    if uploaded_resp:
-        try:
-            df_preview_resp = pd.read_excel(uploaded_resp, engine="openpyxl", nrows=5)
-            st.markdown("**Preview (5 baris pertama)**")
-            st.dataframe(df_preview_resp)
-        except Exception as e:
-            st.warning(f"Gagal membaca preview respons: {e}")
-
-with col2:
-    st.subheader("📘 Upload File Hasil (template daftar siswa)")
-    uploaded_hasil = st.file_uploader("Pilih file hasil (Excel)", type=["xlsx", "xls"], key="hasil")
-    if uploaded_hasil:
-        try:
-            df_preview_hasil = pd.read_excel(uploaded_hasil, engine="openpyxl", nrows=5)
-            st.markdown("**Preview (5 baris pertama)**")
-            st.dataframe(df_preview_hasil)
-        except Exception as e:
-            st.warning(f"Gagal membaca preview hasil: {e}")
-
-st.write("")
-
-colA, colB = st.columns([1, 2])
-with colA:
-    rename_opt = st.checkbox("Auto-rename output dengan timestamp", value=True)
-with colB:
-    st.write("")  # alignment
-    process_btn = st.button("🚀 Proses Data", use_container_width=True)
-
-# placeholders
-log_box = st.empty()
-prog_placeholder = st.empty()
-
-def save_uploaded_to_temp(uploaded_file, prefix):
-    if uploaded_file is None:
-        return None
-    tmpdir = tempfile.mkdtemp(prefix="mbtools_")
-    ext = os.path.splitext(uploaded_file.name)[1] or ".xlsx"
-    tmp_path = os.path.join(tmpdir, prefix + ext)
-    with open(tmp_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    return tmp_path
-
+# Processing action
 if process_btn:
     if not uploaded_resp or not uploaded_hasil:
         st.warning("Silakan upload kedua file (Respons & Hasil) terlebih dahulu.")
     else:
-        logs = []
-        def log_fn(msg):
-            ts = datetime.now().strftime("%H:%M:%S")
-            entry = f"[{ts}] {msg}"
-            logs.append(entry)
-            # show last 200 lines
-            log_box.text("\n".join(logs[-200:]))
-
-        prog = prog_placeholder.progress(0)
-        pct_text = prog_placeholder.empty()
-
-        def progress_fn(p):
-            try:
-                prog.progress(p)
-                pct_text.text(f"{p}%")
-            except:
-                pass
-
         try:
-            path_resp = save_uploaded_to_temp(uploaded_resp, "respons")
-            path_hasil = save_uploaded_to_temp(uploaded_hasil, "hasil")
-            out_path = match_and_write(path_resp, path_hasil, log_fn=log_fn, progress_fn=progress_fn)
+            # read uploaded files to DataFrames
+            df_resp = pd.read_excel(uploaded_resp, engine="openpyxl") if uploaded_resp.name.lower().endswith(("xlsx","xls")) else pd.read_csv(uploaded_resp)
+            df_hasil = pd.read_excel(uploaded_hasil, engine="openpyxl") if uploaded_hasil.name.lower().endswith(("xlsx","xls")) else pd.read_csv(uploaded_hasil)
 
-            # prepare download
-            with open(out_path, "rb") as f:
-                data = f.read()
-            fname = "hasil_pencocokan.xlsx"
+            st.info("Memproses... (ini mungkin memakan beberapa detik tergantung ukuran file)")
+
+            # simple logger collector
+            log_msgs = []
+            def log_fn(msg):
+                log_msgs.append(msg)
+
+            result_df = match_df_bytes(df_resp, df_hasil, log_fn=log_fn)
+
+            # prepare output file (xlsx if openpyxl available, else csv)
+            out_name = "hasil_pencocokan"
             if rename_opt:
                 tstamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                fname = f"hasil_pencocokan_{tstamp}.xlsx"
+                out_name = f"{out_name}_{tstamp}"
+            tmpdir = tempfile.mkdtemp(prefix="mbtools_")
+            out_path_xlsx = os.path.join(tmpdir, out_name + ".xlsx")
+            out_path_csv = os.path.join(tmpdir, out_name + ".csv")
 
-            st.success("✅ Proses selesai!")
-            st.download_button("⬇️ Download Hasil Pencocokan", data, file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            log_fn(f"File output: {out_path}")
+            if HAS_OPENPYXL:
+                # write xlsx
+                result_df.to_excel(out_path_xlsx, index=False, engine="openpyxl")
+                with open(out_path_xlsx, "rb") as f:
+                    data = f.read()
+                st.success("✅ Proses selesai! (output: .xlsx)")
+                st.download_button("⬇️ Download hasil_pencocokan.xlsx", data, file_name=os.path.basename(out_path_xlsx), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            else:
+                # fallback CSV
+                result_df.to_csv(out_path_csv, index=False)
+                with open(out_path_csv, "rb") as f:
+                    data = f.read()
+                st.success("✅ Proses selesai! (openpyxl tidak terpasang — output: .csv)")
+                st.download_button("⬇️ Download hasil_pencocokan.csv", data, file_name=os.path.basename(out_path_csv), mime="text/csv")
+
+            # show short preview of results
+            st.markdown("**Preview hasil (5 baris pertama)**")
+            st.dataframe(result_df.head(5))
+
+            # show logs (if any)
+            if log_msgs:
+                st.markdown("**Log**")
+                for m in log_msgs[-50:]:
+                    st.write(m)
+
         except Exception as e:
-            st.error(f"❌ Terjadi error: {e}")
-            log_fn(f"ERROR: {e}")
-        finally:
-            try:
-                prog_placeholder.empty()
-            except:
-                pass
-
-st.write("")
-st.markdown("<small>Apps by MB — Donasi/Support: wa.me/628522939579</small>", unsafe_allow_html=True)
+            st.error(f"Terjadi error saat memproses: {e}")
+            raise
